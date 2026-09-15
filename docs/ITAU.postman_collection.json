@@ -1,0 +1,926 @@
+{
+  "info": {
+    "_postman_id": "e8640c3e-31c7-4f1f-950b-6e5f2e2a3681",
+    "name": "ITAU - Cadastro de Chaves PIX",
+    "description": "Roteiro de demonstração do módulo de chaves PIX.\n\n**Antes de apresentar**, zere o banco para começar limpo:\n\n```\ndocker compose down -v\ndocker compose up -d\nmvnw spring-boot:run\n```\n\nAs pastas estão numeradas na ordem do roteiro. Rode de cima para baixo (manualmente ou pelo Collection Runner): as pastas 01 a 04 contam a história feliz e a inativação; 05 e 06 mostram as regras de validação.\n\nOs valores das chaves (celular, e-mail, CNPJ com DV válido) são gerados aleatoriamente a cada inclusão, então a collection pode ser rodada várias vezes sem cair em duplicidade. O que acumula é o limite por conta: a conta PF 1234/12345678 aceita 5 chaves, ou seja, cerca de 5 execuções completas antes de precisar zerar o banco.\n\nContas semeadas: 1234/12345678 (PF), 1234/87654321 (PF), 4321/11223344 (PJ), 0001/00000001 (PJ).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "id", "value": "" },
+    { "key": "idEmail", "value": "" },
+    { "key": "idCnpj", "value": "" },
+    { "key": "celular", "value": "" },
+    { "key": "celularMascarado", "value": "" },
+    { "key": "emailSufixo", "value": "" },
+    { "key": "cnpj", "value": "" },
+    { "key": "cnpjMascarado", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "01 - Inclusão",
+      "item": [
+        {
+          "name": "1.1 Incluir celular (com máscara)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const numero = String(Math.floor(Math.random() * 1e8)).padStart(8, '0');",
+                  "pm.collectionVariables.set('celular', '+55119' + numero);",
+                  "pm.collectionVariables.set('celularMascarado', '+55 (11) 9' + numero.slice(0, 4) + '-' + numero.slice(4));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('devolve o UUID gerado', () => pm.expect(pm.response.json().id).to.match(/^[0-9a-f-]{36}$/));",
+                  "if (pm.response.code === 200) {",
+                  "    pm.collectionVariables.set('id', pm.response.json().id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"{{celularMascarado}}\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\",\n    \"sobrenomeCorrentista\": \"Silva\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "A máscara de digitação é removida: a chave é gravada no formato canônico +55119XXXXXXXX. O id é guardado para os próximos requests."
+          }
+        },
+        {
+          "name": "1.2 Incluir e-mail (maiúsculas, sem sobrenome)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('emailSufixo', Date.now().toString(36));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code === 200) {",
+                  "    pm.collectionVariables.set('idEmail', pm.response.json().id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"EMAIL\",\n    \"valorChave\": \"  Maria.Silva.{{emailSufixo}}@Itau.COM.br  \",\n    \"tipoConta\": \"poupança\",\n    \"numeroAgencia\": \"0001\",\n    \"numeroConta\": \"00000001\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "E-mail é gravado com trim + minúsculas. tipoChave em caixa alta e 'poupança' com cedilha também são aceitos. Sem sobrenome (campo opcional)."
+          }
+        },
+        {
+          "name": "1.3 Incluir CNPJ (com pontuação)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// gera um CNPJ aleatório com dígitos verificadores válidos (módulo 11)",
+                  "const d = Array.from({ length: 12 }, () => Math.floor(Math.random() * 10));",
+                  "const dv = (nums, pesos) => { const r = nums.reduce((s, n, i) => s + n * pesos[i], 0) % 11; return r < 2 ? 0 : 11 - r; };",
+                  "d.push(dv(d, [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]));",
+                  "d.push(dv(d, [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]));",
+                  "const c = d.join('');",
+                  "pm.collectionVariables.set('cnpj', c);",
+                  "pm.collectionVariables.set('cnpjMascarado', `${c.slice(0, 2)}.${c.slice(2, 5)}.${c.slice(5, 8)}/${c.slice(8, 12)}-${c.slice(12)}`);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code === 200) {",
+                  "    pm.collectionVariables.set('idCnpj', pm.response.json().id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"cnpj\",\n    \"valorChave\": \"{{cnpjMascarado}}\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"4321\",\n    \"numeroConta\": \"11223344\",\n    \"nomeCorrentista\": \"Itau Unibanco\",\n    \"sobrenomeCorrentista\": \"S.A.\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "CNPJ com pontuação é normalizado para 14 dígitos e tem os dois dígitos verificadores validados. Conta PJ (limite de 20 chaves)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - Consulta",
+      "item": [
+        {
+          "name": "2.1 Consultar por ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('valor gravado no formato canônico', () => pm.expect(body.valorChave).to.eql(pm.collectionVariables.get('celular')));",
+                  "pm.test('data no formato dd/MM/aaaa', () => pm.expect(body.dataHoraInclusao).to.match(/^\\d{2}\\/\\d{2}\\/\\d{4}$/));",
+                  "pm.test('nulo devolvido como string vazia', () => pm.expect(body.dataHoraInativacao).to.eql(''));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}",
+            "description": "Datas da consulta em dd/MM/aaaa e campos nulos como \"\" (tabela 5 do enunciado)."
+          }
+        },
+        {
+          "name": "2.2 Consultar por agência + conta",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const lista = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('todas da conta 1234/12345678', () => lista.forEach(c => pm.expect(`${c.numeroAgencia}/${c.numeroConta}`).to.eql('1234/12345678')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?numeroAgencia=1234&numeroConta=12345678"
+          }
+        },
+        {
+          "name": "2.3 Consultar por tipo de chave",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const lista = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('todas do tipo cnpj', () => lista.forEach(c => pm.expect(c.tipoChave).to.eql('cnpj')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?tipoChave=cnpj"
+          }
+        },
+        {
+          "name": "2.4 Consultar com filtros combinados",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const lista = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('conta e tipo respeitados', () => lista.forEach(c => {",
+                  "    pm.expect(c.numeroConta).to.eql('12345678');",
+                  "    pm.expect(c.tipoChave).to.eql('celular');",
+                  "}));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?numeroAgencia=1234&numeroConta=12345678&tipoChave=celular"
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 - Alteração",
+      "item": [
+        {
+          "name": "3.1 Alterar vínculo da chave",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('vínculo alterado', () => {",
+                  "    pm.expect(body.tipoConta).to.eql('poupanca');",
+                  "    pm.expect(body.sobrenomeCorrentista).to.eql('Souza');",
+                  "});",
+                  "pm.test('tipo e valor da chave preservados', () => {",
+                  "    pm.expect(body.tipoChave).to.eql('celular');",
+                  "    pm.expect(body.valorChave).to.eql(pm.collectionVariables.get('celular'));",
+                  "});",
+                  "pm.test('data de inclusão em DATETIME', () => pm.expect(body.dataHoraInclusao).to.match(/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$/));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoConta\": \"poupanca\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\",\n    \"sobrenomeCorrentista\": \"Souza\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}",
+            "description": "Só o vínculo (conta/titular) muda. tipoChave e valorChave não fazem parte do payload: o case os declara imutáveis. Repare que a resposta traz a data em DATETIME, diferente da consulta."
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 - Inativação",
+      "item": [
+        {
+          "name": "4.1 Inativar chave",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('data de inativação registrada', () => pm.expect(pm.response.json().dataHoraInativacao).to.not.be.empty);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}",
+            "description": "Soft delete: status INACTIVE + dataHoraInativacao. O registro continua no banco."
+          }
+        },
+        {
+          "name": "4.2 Inativar novamente → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('informa que já foi desativada', () => pm.expect(pm.response.json().mensagem).to.include('ja foi desativada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}"
+          }
+        },
+        {
+          "name": "4.3 Consultar chave inativa → 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}",
+            "description": "O case diz que a inativação impede que a chave seja consultada."
+          }
+        },
+        {
+          "name": "4.4 Alterar chave inativa → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('bloqueia alteração', () => pm.expect(pm.response.json().mensagem).to.include('inativa nao pode ser alterada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{id}}"
+          }
+        },
+        {
+          "name": "4.5 Reincluir o valor de uma chave inativa → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('unicidade definitiva', () => pm.expect(pm.response.json().mensagem).to.include('Ja existe chave PIX cadastrada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"{{celular}}\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "O valor de uma chave nunca é reaproveitado, mesmo depois de inativada."
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 - Cenários de erro: inclusão",
+      "item": [
+        {
+          "name": "5.1 E-mail duplicado em outra caixa → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('duplicidade detectada após normalização', () => pm.expect(pm.response.json().mensagem).to.include('Ja existe chave PIX cadastrada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"email\",\n    \"valorChave\": \"MARIA.SILVA.{{emailSufixo}}@ITAU.COM.BR\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"0001\",\n    \"numeroConta\": \"00000001\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "Mesmo e-mail do 1.2 em caixa alta: a unicidade é comparada sobre o valor canônico."
+          }
+        },
+        {
+          "name": "5.2 Celular sem '+' → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('exige o +', () => pm.expect(pm.response.json().mensagem).to.include(\"deve iniciar com '+'\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"5511987654321\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys"
+          }
+        },
+        {
+          "name": "5.3 Celular com letras → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('somente números', () => pm.expect(pm.response.json().mensagem).to.include('somente numeros'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"+5511abc654321\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys"
+          }
+        },
+        {
+          "name": "5.4 Celular com número curto → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('explica o formato', () => pm.expect(pm.response.json().mensagem).to.include('numero com 9 digitos'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"+55119876543\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "Só 11 dígitos após o '+'. O mínimo é 12: país (1 a 2) + DDD (2 a 3) + número (9)."
+          }
+        },
+        {
+          "name": "5.5 CNPJ com dígito verificador inválido → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('DV validado, não só o tamanho', () => pm.expect(pm.response.json().mensagem).to.include('digitos verificadores invalidos'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"cnpj\",\n    \"valorChave\": \"60.701.190/0001-05\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"4321\",\n    \"numeroConta\": \"11223344\",\n    \"nomeCorrentista\": \"Itau Unibanco\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "CNPJ do Itaú (60.701.190/0001-04) com o último dígito trocado."
+          }
+        },
+        {
+          "name": "5.6 E-mail sem '@' → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('exige @', () => pm.expect(pm.response.json().mensagem).to.include(\"deve conter '@'\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"email\",\n    \"valorChave\": \"maria.silva.itau.com.br\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys"
+          }
+        },
+        {
+          "name": "5.7 Tipo de chave não implementado → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('lista os tipos aceitos', () => pm.expect(pm.response.json().mensagem).to.include('Tipo de chave invalido'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"cpf\",\n    \"valorChave\": \"11144477735\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "Foram implementados 3 dos 5 tipos: celular, email e cnpj."
+          }
+        },
+        {
+          "name": "5.8 Conta desconhecida pelo banco → 422",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('celularAvulso', '+55119' + String(Math.floor(Math.random() * 1e8)).padStart(8, '0'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('conta não encontrada', () => pm.expect(pm.response.json().mensagem).to.include('Conta nao encontrada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"{{celularAvulso}}\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"9999\",\n    \"numeroConta\": \"99999999\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "PF/PJ (e o limite de chaves) vem da entidade Account, então a conta precisa existir no banco."
+          }
+        },
+        {
+          "name": "5.9 Campos genéricos inválidos (Bean Validation) → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const msg = pm.response.json().mensagem;",
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('aponta todos os campos inválidos', () => {",
+                  "    pm.expect(msg).to.include('numeroAgencia');",
+                  "    pm.expect(msg).to.include('numeroConta');",
+                  "    pm.expect(msg).to.include('nomeCorrentista');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"+5511987654321\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"12A45\",\n    \"numeroConta\": \"123456789\",\n    \"nomeCorrentista\": \"\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "Agência com letra e 5 dígitos, conta com 9 dígitos, nome vazio. As violações voltam juntas numa única mensagem."
+          }
+        },
+        {
+          "name": "5.10 JSON malformado → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('mesmo corpo de erro', () => pm.expect(pm.response.json()).to.have.property('mensagem'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": ",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys"
+          }
+        },
+        {
+          "name": "5.11 Limite PF (clique Send até estourar)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('celularLimite', '+55119' + String(Math.floor(Math.random() * 1e8)).padStart(8, '0'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 422) {",
+                  "    pm.test('limite de 5 chaves da conta PF atingido', () => pm.expect(pm.response.json().mensagem).to.include('Limite de 5 chaves'));",
+                  "} else {",
+                  "    pm.test('200 enquanto a conta tem vaga', () => pm.response.to.have.status(200));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoChave\": \"celular\",\n    \"valorChave\": \"{{celularLimite}}\",\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"87654321\",\n    \"nomeCorrentista\": \"Joao\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys",
+            "description": "Conta PF dedicada a esta demo (1234/87654321). Cada Send gera um celular novo: as 5 primeiras respondem 200 e a 6ª responde 422. Chaves inativas também contam para o limite."
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 - Cenários de erro: consulta, alteração e inativação",
+      "item": [
+        {
+          "name": "6.1 Consultar ID inexistente → 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/00000000-0000-0000-0000-000000000000"
+          }
+        },
+        {
+          "name": "6.2 ID que não é UUID → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('aponta o parâmetro', () => pm.expect(pm.response.json().mensagem).to.include(\"parametro 'id'\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/nao-e-um-uuid"
+          }
+        },
+        {
+          "name": "6.3 Alterar ID inexistente → 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoConta\": \"corrente\",\n    \"numeroAgencia\": \"1234\",\n    \"numeroConta\": \"12345678\",\n    \"nomeCorrentista\": \"Maria\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys/00000000-0000-0000-0000-000000000000"
+          }
+        },
+        {
+          "name": "6.4 Alterar com tipo de conta inválido → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('tipo de conta inválido', () => pm.expect(pm.response.json().mensagem).to.include('Tipo de conta invalido'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"tipoConta\": \"salario\",\n    \"numeroAgencia\": \"4321\",\n    \"numeroConta\": \"11223344\",\n    \"nomeCorrentista\": \"Itau Unibanco\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{baseUrl}}/api/v1/pix-keys/{{idCnpj}}",
+            "description": "Usa a chave CNPJ do 1.3, que continua ativa."
+          }
+        },
+        {
+          "name": "6.5 Inativar ID inexistente → 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys/00000000-0000-0000-0000-000000000000"
+          }
+        },
+        {
+          "name": "6.6 ID combinado com outros filtros → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('orienta usar o endpoint por ID', () => pm.expect(pm.response.json().mensagem).to.include('nao aceita outros filtros'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?id={{idCnpj}}&tipoChave=cnpj",
+            "description": "Critério do case: se informar o ID, nenhum outro filtro pode ser aceito."
+          }
+        },
+        {
+          "name": "6.7 Agência sem conta → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('exige os dois juntos', () => pm.expect(pm.response.json().mensagem).to.include('devem ser informados juntos'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?numeroAgencia=1234"
+          }
+        },
+        {
+          "name": "6.8 Consulta sem nenhum filtro → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('exige ao menos um filtro', () => pm.expect(pm.response.json().mensagem).to.include('ao menos um filtro'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys"
+          }
+        },
+        {
+          "name": "6.9 Filtro com tipo de chave inválido → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?tipoChave=aleatorio"
+          }
+        },
+        {
+          "name": "6.10 Consulta sem resultado → 404",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('nenhuma chave encontrada', () => pm.expect(pm.response.json().mensagem).to.include('Nenhuma chave PIX encontrada'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/pix-keys?numeroAgencia=1234&numeroConta=12345678&tipoChave=cnpj",
+            "description": "A conta 1234/12345678 não tem chave CNPJ."
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,544 @@
+' =====================================================================
+'  Cadastro de Chaves PIX - Diagramas de sequencia
+'  Um bloco @startuml por fluxo. Renderize em plantuml.com, no plugin
+'  PlantUML do IntelliJ, ou via `plantuml docs/diagramas-sequencia.puml`.
+' =====================================================================
+
+
+' ---------------------------------------------------------------------
+' 1. INCLUSAO - o fluxo mais completo, exercita todas as regras
+' ---------------------------------------------------------------------
+@startuml inclusao
+title Inclusão de chave PIX — POST /api/v1/pix-keys
+
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor Cliente
+participant "PixKeyController" as Controller <<@RestController>>
+participant "Bean Validation" as BeanValidation <<jakarta.validation>>
+participant "PixKeyService" as Service <<@Service>>
+participant "KeyType\nAccountType" as Enums <<domain>>
+collections "List<PixKeyValidator>" as Validators <<Strategy>>
+participant "PixKeyRepository" as PixRepo <<Spring Data>>
+participant "AccountRepository" as AccountRepo <<Spring Data>>
+participant "PixKey" as Entidade <<@Entity>>
+participant "ApiExceptionHandler" as Advice <<@RestControllerAdvice>>
+
+Cliente -> Controller: POST /api/v1/pix-keys\nCreatePixKeyRequest
+activate Controller
+
+Controller -> BeanValidation: @Valid
+activate BeanValidation
+note right of BeanValidation
+  Regras genéricas de campo:
+  obrigatoriedade, tamanhos,
+  agência/conta numéricas
+end note
+
+alt campo inválido
+    BeanValidation --> Advice: MethodArgumentNotValidException
+    activate Advice
+    Advice --> Cliente: 422 {"mensagem": "..."}
+    deactivate Advice
+end
+BeanValidation --> Controller: ok
+deactivate BeanValidation
+
+Controller -> Service: incluir(request)
+activate Service
+
+== Conversão dos enums ==
+Service -> Enums: KeyType.from("celular")
+activate Enums
+alt tipo não implementado
+    Enums --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Tipo de chave inválido"
+    deactivate Advice
+end
+Enums --> Service: KeyType.CELULAR
+deactivate Enums
+
+Service -> Enums: AccountType.from("corrente")
+activate Enums
+Enums --> Service: AccountType.CORRENTE
+deactivate Enums
+
+== Seleção da Strategy ==
+Service -> Validators: validatorDe(CELULAR)
+activate Validators
+loop para cada validator injetado
+    Validators -> Validators: supports(CELULAR)
+end
+Validators --> Service: CelularValidator
+deactivate Validators
+note right of Service
+  Sem if/else por tipo.
+  Incluir CPF = criar uma classe nova,
+  o service não muda.
+end note
+
+== Normalização e validação do valor ==
+Service -> Validators: normalize("+55 (11) 98765-4321")
+activate Validators
+Validators --> Service: "+5511987654321" (valor canônico)
+deactivate Validators
+
+Service -> Validators: validate("+5511987654321")
+activate Validators
+alt formato inválido
+    Validators --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "deve iniciar com '+'..."
+    deactivate Advice
+end
+Validators --> Service: ok
+deactivate Validators
+
+== Unicidade global e definitiva ==
+Service -> PixRepo: existsByValorChave(valorCanônico)
+activate PixRepo
+PixRepo --> Service: boolean
+deactivate PixRepo
+alt valor já cadastrado
+    note right of Service
+      Vale mesmo se a chave
+      existente estiver INACTIVE
+    end note
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Já existe chave PIX cadastrada"
+    deactivate Advice
+end
+
+== A conta precisa ser conhecida pelo banco ==
+Service -> AccountRepo: findByNumeroAgenciaAndNumeroConta("1234","12345678")
+activate AccountRepo
+AccountRepo --> Service: Optional<Account>
+deactivate AccountRepo
+alt conta inexistente
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Conta não encontrada"
+    deactivate Advice
+end
+
+== Limite por conta (PF=5 / PJ=20) ==
+Service -> PixRepo: countByNumeroAgenciaAndNumeroConta(...)
+activate PixRepo
+PixRepo --> Service: total de chaves da conta
+deactivate PixRepo
+Service -> Service: account.limiteDeChaves()
+note right of Service
+  O payload não traz documento do titular,
+  então PF/PJ vem da entidade Account.
+  Conta TODAS as chaves, ativas e inativas.
+end note
+alt limite atingido
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Limite de 5 chaves atingido"
+    deactivate Advice
+end
+
+== Persistência ==
+Service -> Entidade: new PixKey(tipo, valorCanônico, ...)
+activate Entidade
+Entidade -> Entidade: id = UUID.randomUUID()\ndataHoraInclusao = now()\nstatus = ACTIVE
+Entidade --> Service: chave
+deactivate Entidade
+
+Service -> PixRepo: save(chave)
+activate PixRepo
+note right of PixRepo
+  Constraint UNIQUE em valor_chave
+  é a rede de segurança contra
+  inclusões concorrentes
+end note
+PixRepo --> Service: chave persistida
+deactivate PixRepo
+
+Service --> Controller: UUID
+deactivate Service
+
+Controller -> Controller: PixKeyCreatedResponse.of(id)
+Controller --> Cliente: 200 OK\n{"id": "<uuid>"}
+deactivate Controller
+
+note across
+  O case pede 200 explicitamente na inclusão, não 201.
+end note
+
+@enduml
+
+
+' ---------------------------------------------------------------------
+' 2. ALTERACAO - so o vinculo muda
+' ---------------------------------------------------------------------
+@startuml alteracao
+title Alteração de chave PIX — PUT /api/v1/pix-keys/{id}
+
+skinparam responseMessageBelowArrow true
+
+actor Cliente
+participant "PixKeyController" as Controller
+participant "PixKeyService" as Service
+participant "PixKeyRepository" as PixRepo
+participant "PixKey" as Entidade
+participant "ApiExceptionHandler" as Advice
+
+Cliente -> Controller: PUT /api/v1/pix-keys/{id}\nUpdatePixKeyRequest
+activate Controller
+note right of Controller
+  tipoChave e valorChave não são
+  aceitos no payload: o case os
+  declara imutáveis (critérios 3 e 4)
+end note
+
+Controller -> Service: alterar(id, request)
+activate Service
+
+Service -> PixRepo: findById(id)
+activate PixRepo
+PixRepo --> Service: Optional<PixKey>
+deactivate PixRepo
+
+alt id não encontrado
+    Service --> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404 {"mensagem": "Chave PIX não encontrada"}
+    deactivate Advice
+end
+
+Service -> Entidade: isInativa()
+activate Entidade
+Entidade --> Service: boolean
+deactivate Entidade
+
+alt chave INACTIVE
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Chave PIX inativa não pode ser alterada"
+    deactivate Advice
+end
+
+Service -> Entidade: alterarVinculo(tipoConta, agência, conta, nome, sobrenome)
+activate Entidade
+note right of Entidade
+  Só o vínculo muda.
+  tipoChave e valorChave são
+  updatable = false na entidade.
+end note
+Entidade --> Service
+deactivate Entidade
+
+Service -> PixRepo: save(chave)
+activate PixRepo
+PixRepo --> Service: chave
+deactivate PixRepo
+
+Service -> Service: PixKeyResponse.of(chave)
+note right of Service
+  Datas em DATETIME (ISO-8601),
+  conforme tabela 3 do enunciado
+end note
+Service --> Controller: PixKeyResponse
+deactivate Service
+
+Controller --> Cliente: 200 OK\n{id, tipoChave, valorChave, ..., dataHoraInclusao}
+deactivate Controller
+
+@enduml
+
+
+' ---------------------------------------------------------------------
+' 3. INATIVACAO - soft delete
+' ---------------------------------------------------------------------
+@startuml inativacao
+title Inativação de chave PIX (soft delete) — DELETE /api/v1/pix-keys/{id}
+
+skinparam responseMessageBelowArrow true
+
+actor Cliente
+participant "PixKeyController" as Controller
+participant "PixKeyService" as Service
+participant "PixKeyRepository" as PixRepo
+participant "PixKey" as Entidade
+participant "ApiExceptionHandler" as Advice
+
+Cliente -> Controller: DELETE /api/v1/pix-keys/{id}
+activate Controller
+note right of Controller: Só o id no path, sem payload
+
+Controller -> Service: inativar(id)
+activate Service
+
+Service -> PixRepo: findById(id)
+activate PixRepo
+PixRepo --> Service: Optional<PixKey>
+deactivate PixRepo
+
+alt id não encontrado
+    Service --> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404
+    deactivate Advice
+end
+
+Service -> Entidade: isInativa()
+activate Entidade
+Entidade --> Service: boolean
+deactivate Entidade
+
+alt chave já INACTIVE
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Chave PIX já foi desativada em <data>"
+    deactivate Advice
+end
+
+Service -> Entidade: inativar()
+activate Entidade
+Entidade -> Entidade: status = INACTIVE\ndataHoraInativacao = now()
+note right of Entidade
+  Soft delete: o registro permanece
+  no banco. É isso que sustenta a
+  unicidade definitiva do valorChave.
+end note
+Entidade --> Service
+deactivate Entidade
+
+Service -> PixRepo: save(chave)
+activate PixRepo
+PixRepo --> Service: chave
+deactivate PixRepo
+
+Service -> Service: InactivatedPixKeyResponse.of(chave)
+Service --> Controller: InactivatedPixKeyResponse
+deactivate Service
+
+Controller --> Cliente: 200 OK\n{..., dataHoraInclusao, dataHoraInativacao}
+deactivate Controller
+
+@enduml
+
+
+' ---------------------------------------------------------------------
+' 4. CONSULTA POR ID
+' ---------------------------------------------------------------------
+@startuml consulta-por-id
+title Consulta por ID — GET /api/v1/pix-keys/{id}
+
+skinparam responseMessageBelowArrow true
+
+actor Cliente
+participant "PixKeyController" as Controller
+participant "PixKeyService" as Service
+participant "PixKeyRepository" as PixRepo
+participant "ApiExceptionHandler" as Advice
+
+Cliente -> Controller: GET /api/v1/pix-keys/{id}
+activate Controller
+
+alt id do path não é um UUID
+    Controller --> Advice: MethodArgumentTypeMismatchException
+    activate Advice
+    Advice --> Cliente: 422 "Valor inválido para o parâmetro 'id'"
+    deactivate Advice
+end
+
+Controller -> Service: consultarPorId(id)
+activate Service
+
+Service -> PixRepo: findById(id)
+activate PixRepo
+PixRepo --> Service: Optional<PixKey>
+deactivate PixRepo
+
+alt id não encontrado
+    Service --> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404
+    deactivate Advice
+else chave INACTIVE
+    note right of Service
+      O case diz que a inativação impede
+      que a chave seja "alterada ou consultada".
+      Logo, 404 — não 422.
+    end note
+    Service --> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404
+    deactivate Advice
+end
+
+Service -> Service: PixKeySearchResponse.of(chave)
+note right of Service
+  Datas em dd/MM/aaaa e campos
+  nulos como "", conforme tabela 5
+end note
+Service --> Controller: PixKeySearchResponse
+deactivate Service
+
+Controller --> Cliente: 200 OK
+deactivate Controller
+
+@enduml
+
+
+' ---------------------------------------------------------------------
+' 5. CONSULTA POR FILTROS COMBINAVEIS
+' ---------------------------------------------------------------------
+@startuml consulta-por-filtros
+title Consulta por filtros — GET /api/v1/pix-keys?numeroAgencia=&numeroConta=&tipoChave=
+
+skinparam responseMessageBelowArrow true
+
+actor Cliente
+participant "PixKeyController" as Controller
+participant "PixKeyService" as Service
+participant "KeyType" as Enums
+participant "PixKeyRepository" as PixRepo
+participant "ApiExceptionHandler" as Advice
+
+Cliente -> Controller: GET /api/v1/pix-keys?filtros
+activate Controller
+Controller -> Service: consultar(id, numeroAgencia, numeroConta, tipoChave)
+activate Service
+
+== Validação dos filtros ==
+alt id informado junto de filtros
+    note right of Service
+      Critério do case: ID não combina
+      com outros filtros. Há endpoint próprio.
+    end note
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Utilize GET /api/v1/pix-keys/{id}"
+    deactivate Advice
+else agência sem conta (ou vice-versa)
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "devem ser informados juntos"
+    deactivate Advice
+end
+
+opt tipoChave informado
+    Service -> Enums: KeyType.from(tipoChave)
+    activate Enums
+    alt tipo inválido
+        Enums --> Advice: PixValidationException
+        activate Advice
+        Advice --> Cliente: 422 "Tipo de chave inválido"
+        deactivate Advice
+    end
+    Enums --> Service: KeyType
+    deactivate Enums
+end
+
+alt nenhum filtro informado
+    Service --> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 "Informe ao menos um filtro"
+    deactivate Advice
+end
+
+== Seleção do finder (métodos nomeados, sem Specification) ==
+alt agência+conta E tipo
+    Service -> PixRepo: findByStatusAndNumeroAgenciaAndNumeroContaAndTipoChave(ACTIVE, ...)
+else somente agência+conta
+    Service -> PixRepo: findByStatusAndNumeroAgenciaAndNumeroConta(ACTIVE, ...)
+else somente tipo
+    Service -> PixRepo: findByStatusAndTipoChave(ACTIVE, tipo)
+end
+activate PixRepo
+note right of PixRepo
+  O filtro por KeyStatus.ACTIVE está
+  em todos: chave inativa não é consultável
+end note
+PixRepo --> Service: List<PixKey>
+deactivate PixRepo
+
+alt lista vazia
+    Service --> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404 "Nenhuma chave PIX encontrada"
+    deactivate Advice
+end
+
+Service -> Service: map(PixKeySearchResponse::of)
+Service --> Controller: List<PixKeySearchResponse>
+deactivate Service
+
+Controller --> Cliente: 200 OK\n[ {...}, {...} ]
+deactivate Controller
+
+@enduml
+
+
+' ---------------------------------------------------------------------
+' 6. TRATAMENTO DE ERRO - visao transversal
+' ---------------------------------------------------------------------
+@startuml tratamento-de-erro
+title Tratamento de erro — ponto único de tradução exceção → HTTP
+
+skinparam responseMessageBelowArrow true
+
+participant "Camadas da aplicação" as App
+participant "ApiExceptionHandler" as Advice <<@RestControllerAdvice>>
+actor Cliente
+
+group Regra de negócio / validação → 422
+    App -> Advice: PixValidationException
+    activate Advice
+    Advice --> Cliente: 422 {"mensagem": <mensagem da exceção>}
+    deactivate Advice
+end
+
+group Bean Validation nos DTOs → 422
+    App -> Advice: MethodArgumentNotValidException
+    activate Advice
+    Advice -> Advice: junta as mensagens dos campos com "; "
+    Advice --> Cliente: 422 {"mensagem": "campo A ...; campo B ..."}
+    deactivate Advice
+end
+
+group Path variable com tipo errado → 422
+    App -> Advice: MethodArgumentTypeMismatchException
+    activate Advice
+    Advice --> Cliente: 422 {"mensagem": "Valor inválido para o parâmetro 'id'"}
+    deactivate Advice
+end
+
+group JSON ausente ou malformado → 422
+    App -> Advice: HttpMessageNotReadableException
+    activate Advice
+    Advice --> Cliente: 422 {"mensagem": "Corpo da requisição ausente ou mal formatado"}
+    deactivate Advice
+end
+
+group Constraint UNIQUE violada (corrida) → 422
+    App -> Advice: DataIntegrityViolationException
+    activate Advice
+    note right of Advice
+      Rede de segurança: duas inclusões
+      concorrentes passam pelo existsByValorChave
+      mas só uma sobrevive ao UNIQUE do banco
+    end note
+    Advice --> Cliente: 422 {"mensagem": "Valor de chave PIX já cadastrado"}
+    deactivate Advice
+end
+
+group Recurso inexistente → 404
+    App -> Advice: PixKeyNotFoundException
+    activate Advice
+    Advice --> Cliente: 404 {"mensagem": <mensagem da exceção>}
+    deactivate Advice
+end
+
+note across
+  Um único corpo de erro em toda a API: {"mensagem": "texto livre"}
+end note
+
+@enduml
