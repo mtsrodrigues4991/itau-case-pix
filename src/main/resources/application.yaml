@@ -7,6 +7,8 @@ spring:
     url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/pixdb}
     username: ${POSTGRES_USER:pix}
     password: ${POSTGRES_PASSWORD:pix}
+    hikari:
+      maximum-pool-size: 40
   jpa:
     hibernate:
       ddl-auto: update
